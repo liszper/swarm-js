@@ -1,8 +1,19 @@
-import { Swarm, Result } from './src/swarm.js';
-import { Agent } from './src/types.js';
+import 'dotenv/config';
+import { Swarm } from './src/swarm.js';
+import { runDemoLoop } from './src/repl.js';
+import Agent from './src/agent.js';
+import { Result } from './src/types.js';
 
 // Example usage
 const client = new Swarm();
+
+console.log('OPENAI_API_KEY:', process.env.OPENAI_API_KEY);
+
+const salesAgent = new Agent({
+  name: 'SalesAgent',
+  instructions: 'You are a knowledgeable sales agent. Help the user with their purchase inquiries.',
+  functions: []
+});
 
 const greetAgent = new Agent({
   name: 'GreetAgent',
@@ -16,17 +27,11 @@ const greetAgent = new Agent({
   ]
 });
 
-const salesAgent = new Agent({
-  name: 'SalesAgent',
-  instructions: 'You are a knowledgeable sales agent. Help the user with their purchase inquiries.',
-  functions: []
-});
-
 async function runDemo() {
   try {
     const response = await client.run({
       agent: greetAgent,
-      messages: [{ role: 'user', content: 'Hello, I need help with a purchase.' }],
+      messages: [{ role: 'user', content: 'Hello, I need help with a purchase, transfer me to the sales agent.' }],
       contextVariables: { userName: 'John' },
       debug: true
     });

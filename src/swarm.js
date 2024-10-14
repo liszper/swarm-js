@@ -36,7 +36,9 @@ export class Swarm {
     };
 
     if (tools.length > 0) {
-      createParams.parallel_tool_calls = agent.parallelToolCalls;
+      // Ensure agent.parallelToolCalls is a boolean
+      createParams.parallel_tool_calls = Boolean(agent.parallelToolCalls);
+      debugPrint(debug, `Setting parallel_tool_calls to: ${createParams.parallel_tool_calls}`);
     }
 
     return this.openai.chat.completions.create(createParams);
@@ -62,7 +64,7 @@ export class Swarm {
   }
 
   async handleToolCalls(toolCalls, functions, contextVariables, debug) {
-    const functionMap = Object.fromEntries(functions.map(f => [f.name, f]));
+    const functionMap = Object.fromEntries(functions.map(f => [f.name, f.function]));
     const partialResponse = new Response();
 
     for (const toolCall of toolCalls) {
@@ -82,23 +84,46 @@ export class Swarm {
       debugPrint(debug, `Processing tool call: ${name} with arguments ${JSON.stringify(args)}`);
 
       const func = functionMap[name];
+      if (typeof func !== 'function') {
+        const errorMessage = `Error: ${name} is not a function.`;
+        debugPrint(debug, errorMessage);
+        partialResponse.messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          tool_name: name,
+          content: errorMessage
+        });
+        continue;
+      }
+
       if (func.length > 0 && func.toString().includes(__CTX_VARS_NAME__)) {
         args[__CTX_VARS_NAME__] = contextVariables;
       }
 
-      const rawResult = await func(args);
-      const result = this.handleFunctionResult(rawResult, debug);
+      try {
+        const rawResult = await func(args);
+        const result = this.handleFunctionResult(rawResult, debug);
 
-      partialResponse.messages.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        tool_name: name,
-        content: result.value
-      });
+        partialResponse.messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          tool_name: name,
+          content: result.value
+        });
 
-      partialResponse.contextVariables = { ...partialResponse.contextVariables, ...result.contextVariables };
-      if (result.agent) {
-        partialResponse.agent = result.agent;
+        partialResponse.contextVariables = { ...partialResponse.contextVariables, ...result.contextVariables };
+        if (result.agent) {
+          partialResponse.agent = result.agent;
+        }
+      } catch (error) {
+        const errorMessage = `Error executing ${name}: ${error.message}`;
+        debugPrint(debug, errorMessage);
+        partialResponse.messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          tool_name: name,
+          content: errorMessage
+        });
       }
     }
 
