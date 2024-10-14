@@ -6,16 +6,25 @@ export class MockOpenAIClient {
 
   setResponse(response) {
     this.responses = [response];
+    this.currentResponseIndex = 0;
+    console.log('Set single response:', this.responses);
   }
 
   setSequentialResponses(responses) {
     this.responses = responses;
     this.currentResponseIndex = 0;
+    console.log('Set sequential responses:', this.responses);
+  }
+
+  resetResponseIndex() {
+    this.currentResponseIndex = 0;
+    console.log('Reset response index');
   }
 
   chat = {
     completions: {
       create: async (params) => {
+        console.log('Creating completion, current index:', this.currentResponseIndex, 'total responses:', this.responses.length);
         if (this.currentResponseIndex >= this.responses.length) {
           throw new Error("No more mock responses available");
         }

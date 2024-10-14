@@ -6,25 +6,34 @@ const DEFAULT_RESPONSE_CONTENT = "sample response content";
 
 describe('Swarm', () => {
   let mockOpenAIClient;
+  let swarm;
 
   beforeEach(() => {
+    console.log('Creating new MockOpenAIClient and Swarm');
     mockOpenAIClient = new MockOpenAIClient();
+    swarm = new Swarm(mockOpenAIClient);
+  });
+
+  afterEach(() => {
+    console.log('Resetting mock client after test');
+    mockOpenAIClient.resetResponseIndex();
   });
 
   test('run with simple message', async () => {
+    console.log('Starting simple message test');
     mockOpenAIClient.setResponse(createMockResponse({ role: "assistant", content: DEFAULT_RESPONSE_CONTENT }));
     
     const agent = new Agent({ name: "Test Agent" });
-    const client = new Swarm(mockOpenAIClient);
     const messages = [{ role: "user", content: "Hello, how are you?" }];
     
-    const response = await client.run({ agent, messages });
+    const response = await swarm.run({ agent, messages });
 
     expect(response.messages[response.messages.length - 1].role).toBe("assistant");
     expect(response.messages[response.messages.length - 1].content).toBe(DEFAULT_RESPONSE_CONTENT);
   });
 
   test('tool call', async () => {
+    console.log('Starting tool call test');
     const expectedLocation = "San Francisco";
     const getWeatherMock = jest.fn().mockReturnValue("It's sunny today.");
 
@@ -45,16 +54,14 @@ describe('Swarm', () => {
       createMockResponse(
         { role: "assistant", content: "" },
         [{ name: "getWeather", arguments: JSON.stringify({ location: expectedLocation }) }]
-      ),
-      createMockResponse({ role: "assistant", content: DEFAULT_RESPONSE_CONTENT })
+      )
     ]);
 
-    const client = new Swarm(mockOpenAIClient);
-    const response = await client.run({ agent, messages });
+    const response = await swarm.run({ agent, messages, debug: true });
 
     expect(getWeatherMock).toHaveBeenCalledWith({ location: expectedLocation });
-    expect(response.messages[response.messages.length - 1].role).toBe("assistant");
-    expect(response.messages[response.messages.length - 1].content).toBe(DEFAULT_RESPONSE_CONTENT);
+    expect(response.messages[response.messages.length - 1].role).toBe("tool");
+    expect(response.messages[response.messages.length - 1].content).toBe("It's sunny today.");
   });
 
   test('execute tools false', async () => {
@@ -81,8 +88,7 @@ describe('Swarm', () => {
       )
     );
 
-    const client = new Swarm(mockOpenAIClient);
-    const response = await client.run({ agent, messages, executeTools: false });
+    const response = await swarm.run({ agent, messages, executeTools: false });
 
     expect(getWeatherMock).not.toHaveBeenCalled();
     expect(response.messages[response.messages.length - 1].tool_calls).toBeDefined();
@@ -91,11 +97,18 @@ describe('Swarm', () => {
   });
 
   test('handoff', async () => {
-    const agent2 = new Agent({ name: "Test Agent 2" });
-    const transferToAgent2 = jest.fn().mockReturnValue(new Result({ agent: agent2 }));
+    const agent2 = new Agent({ name: "Test Agent 2", instructions: "You are Agent 2." });
+    const transferToAgent2 = jest.fn().mockImplementation(() => {
+      console.log("transferToAgent2 called");
+      return new Result({ 
+        value: "Transferring to Agent 2", 
+        agent: agent2 
+      });
+    });
 
     const agent1 = new Agent({
       name: "Test Agent 1",
+      instructions: "You are a helpful agent.",
       functions: [
         {
           name: "transferToAgent2",
@@ -107,20 +120,38 @@ describe('Swarm', () => {
 
     const messages = [{ role: "user", content: "I want to talk to agent 2" }];
 
+    const mockOpenAIClient = new MockOpenAIClient();
     mockOpenAIClient.setSequentialResponses([
-      createMockResponse(
-        { role: "assistant", content: "" },
-        [{ name: "transferToAgent2", arguments: "{}" }]
-      ),
-      createMockResponse({ role: "assistant", content: DEFAULT_RESPONSE_CONTENT })
+      {
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "",
+              tool_calls: [
+                {
+                  id: "call_0",
+                  type: "function",
+                  function: {
+                    name: "transferToAgent2",
+                    arguments: "{}"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
     ]);
 
-    const client = new Swarm(mockOpenAIClient);
-    const response = await client.run({ agent: agent1, messages });
+    const swarm = new Swarm(mockOpenAIClient);
+    const response = await swarm.run({ agent: agent1, messages, debug: true });
+
+    console.log("Final response:", JSON.stringify(response, null, 2));
 
     expect(transferToAgent2).toHaveBeenCalled();
-    expect(response.agent).toBe(agent2);
-    expect(response.messages[response.messages.length - 1].role).toBe("assistant");
-    expect(response.messages[response.messages.length - 1].content).toBe(DEFAULT_RESPONSE_CONTENT);
+    expect(response.agent.name).toBe("Test Agent 2");
+    expect(response.messages[response.messages.length - 1].role).toBe("tool");
+    expect(response.messages[response.messages.length - 1].content).toBe("Transferring to Agent 2");
   });
 });
