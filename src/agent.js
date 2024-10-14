@@ -1,19 +1,15 @@
-class Agent {
-  constructor({
-    name,
-    model = 'gpt-4',
-    instructions,
-    functions = [],
-    toolChoice = null,
-    parallelToolCalls = true,
-  }) {
+export default class Agent {
+  constructor({ name, instructions, functions, model = 'gpt-3.5-turbo', toolChoice = 'auto', parallelToolCalls = true }) {
     this.name = name;
-    this.model = model;
     this.instructions = instructions;
     this.functions = functions;
+    this.model = model;
     this.toolChoice = toolChoice;
     this.parallelToolCalls = parallelToolCalls;
   }
-}
 
-export default Agent;
+  getFunction(name) {
+    const func = this.functions.find(f => f.name === name);
+    return func ? func.function : null;
+  }
+}

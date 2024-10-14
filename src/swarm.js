@@ -7,7 +7,6 @@ const __CTX_VARS_NAME__ = "context_variables";
 export class Swarm {
   constructor(client = null) {
     this.openai = client || new OpenAI();
-    this.isMockClient = client && client.constructor.name === 'MockOpenAIClient';
   }
 
   async getChatCompletion(agent, history, contextVariables, modelOverride, stream, debug) {
@@ -18,7 +17,19 @@ export class Swarm {
     const messages = [{ role: 'system', content: instructions }, ...history];
     debugPrint(debug, "Getting chat completion for...:", messages);
 
-    const tools = agent.functions.map(f => functionToJson(f));
+    const tools = agent.functions.map(f => ({
+      type: 'function',
+      function: {
+        name: f.name,
+        description: f.description,
+        parameters: {
+          type: 'object',
+          properties: f.function.length > 0 ? { question: { type: 'string' } } : {},
+          required: f.function.length > 0 ? ['question'] : []
+        }
+      }
+    }));
+
     // Hide context_variables from model
     for (const tool of tools) {
       const params = tool.function.parameters;
@@ -32,50 +43,43 @@ export class Swarm {
       model: modelOverride || agent.model,
       messages,
       tools: tools.length > 0 ? tools : undefined,
-      tool_choice: agent.toolChoice,
       stream
     };
 
     if (tools.length > 0) {
-      // Ensure agent.parallelToolCalls is a boolean
-      createParams.parallel_tool_calls = Boolean(agent.parallelToolCalls);
-      debugPrint(debug, `Setting parallel_tool_calls to: ${createParams.parallel_tool_calls}`);
+      createParams.tool_choice = agent.toolChoice === 'auto' ? 'auto' : { type: 'function', function: { name: agent.toolChoice } };
     }
 
-    debugPrint(debug, "Calling OpenAI API with params:", createParams);
     return this.openai.chat.completions.create(createParams);
   }
 
   handleFunctionResult(result, debug) {
-    debugPrint(debug, "Handling function result:", result);
     if (result instanceof Result) {
-      debugPrint(debug, "Result is an instance of Result");
       return result;
     } else if (result instanceof Agent) {
-      debugPrint(debug, "Result is an instance of Agent");
       return new Result({
-        value: `Transferring to ${result.name}`,
+        value: JSON.stringify({ assistant: result.name }),
         agent: result
       });
     } else {
-      debugPrint(debug, "Result is neither Result nor Agent");
       try {
-        return new Result({ value: result });
+        return new Result({ value: String(result) });
       } catch (e) {
-        const errorMessage = `Failed to process result: ${result}. Make sure agent functions return a string, Result object, or Agent object. Error: ${e.message}`;
+        const errorMessage = `Failed to cast response to string: ${result}. Make sure agent functions return a string or Result object. Error: ${e.message}`;
         debugPrint(debug, errorMessage);
         throw new TypeError(errorMessage);
       }
     }
   }
 
-  async handleToolCalls(toolCalls, functions, contextVariables, debug) {
-    const functionMap = Object.fromEntries(functions.map(f => [f.name, f.function]));
+  async handleToolCalls(toolCalls, agent, contextVariables, debug) {
     const partialResponse = new Response();
 
     for (const toolCall of toolCalls) {
       const name = toolCall.function.name;
-      if (!(name in functionMap)) {
+      const func = agent.getFunction(name);
+      
+      if (!func) {
         debugPrint(debug, `Tool ${name} not found in function map.`);
         partialResponse.messages.push({
           role: 'tool',
@@ -86,56 +90,42 @@ export class Swarm {
         continue;
       }
 
-      const args = JSON.parse(toolCall.function.arguments);
-      debugPrint(debug, `Processing tool call: ${name} with arguments ${JSON.stringify(args)}`);
-
-      const func = functionMap[name];
-      if (typeof func !== 'function') {
-        const errorMessage = `Error: ${name} is not a function.`;
-        debugPrint(debug, errorMessage);
+      let args;
+      try {
+        args = JSON.parse(toolCall.function.arguments);
+      } catch (error) {
+        debugPrint(debug, `Error parsing arguments for ${name}: ${error.message}`);
         partialResponse.messages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
           tool_name: name,
-          content: errorMessage
+          content: `Error: Invalid arguments provided for ${name}.`
         });
         continue;
       }
 
-      try {
-        const rawResult = await func(args);
-        debugPrint(debug, `Raw result from ${name}:`, rawResult);
-        const result = this.handleFunctionResult(rawResult, debug);
-        debugPrint(debug, `Processed result from ${name}:`, result);
+      debugPrint(debug, `Processing tool call: ${name} with arguments ${JSON.stringify(args)}`);
 
-        partialResponse.messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          tool_name: name,
-          content: result.value.toString()
-        });
+      if (func.length > 0 && func.toString().includes(__CTX_VARS_NAME__)) {
+        args[__CTX_VARS_NAME__] = contextVariables;
+      }
 
-        partialResponse.contextVariables = { ...partialResponse.contextVariables, ...result.contextVariables };
-        if (result.agent) {
-          partialResponse.agent = result.agent;
-          debugPrint(debug, `Handoff detected. New agent: ${result.agent.name}`);
-          return partialResponse; // Return immediately after detecting a handoff
-        } else {
-          debugPrint(debug, `No handoff detected from ${name}`);
-        }
-      } catch (error) {
-        const errorMessage = `Error executing ${name}: ${error.message}`;
-        debugPrint(debug, errorMessage);
-        partialResponse.messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          tool_name: name,
-          content: errorMessage
-        });
+      const rawResult = await func(args);
+      const result = this.handleFunctionResult(rawResult, debug);
+
+      partialResponse.messages.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        tool_name: name,
+        content: result.value
+      });
+
+      partialResponse.contextVariables = { ...partialResponse.contextVariables, ...result.contextVariables };
+      if (result.agent) {
+        partialResponse.agent = result.agent;
       }
     }
 
-    debugPrint(debug, `Partial response after handling tool calls:`, partialResponse);
     return partialResponse;
   }
 
@@ -148,10 +138,7 @@ export class Swarm {
     let history = [...messages];
     const initLen = messages.length;
 
-    debugPrint(debug, `Starting run with agent: ${activeAgent.name}`);
-
     while (history.length - initLen < maxTurns && activeAgent) {
-      debugPrint(debug, `Starting turn ${history.length - initLen + 1}`);
       const completion = await this.getChatCompletion(
         activeAgent,
         history,
@@ -167,13 +154,13 @@ export class Swarm {
       history.push(JSON.parse(JSON.stringify(message)));
 
       if (!message.tool_calls || !executeTools) {
-        debugPrint(debug, "No tool calls or executeTools is false. Ending turn.");
+        debugPrint(debug, "Ending turn.");
         break;
       }
 
       const partialResponse = await this.handleToolCalls(
         message.tool_calls,
-        activeAgent.functions,
+        activeAgent,
         contextVariables,
         debug
       );
@@ -182,21 +169,9 @@ export class Swarm {
       contextVariables = { ...contextVariables, ...partialResponse.contextVariables };
       if (partialResponse.agent) {
         activeAgent = partialResponse.agent;
-        debugPrint(debug, `Handoff occurred. New active agent: ${activeAgent.name}`);
-        // Continue the loop with the new agent
-        continue;
-      } else {
-        debugPrint(debug, `No handoff occurred. Active agent remains: ${activeAgent.name}`);
-      }
-
-      // If using a mock client, we don't need to make another API call
-      if (this.isMockClient) {
-        debugPrint(debug, "Using mock client. Ending after one turn.");
-        break;
       }
     }
 
-    debugPrint(debug, `Run completed. Final active agent: ${activeAgent.name}`);
     return new Response({
       messages: history.slice(initLen),
       agent: activeAgent,
@@ -252,7 +227,7 @@ export class Swarm {
 
       const partialResponse = await this.handleToolCalls(
         message.tool_calls,
-        activeAgent.functions,
+        activeAgent,
         contextVariables,
         debug
       );

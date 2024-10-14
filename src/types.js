@@ -16,7 +16,7 @@ export const AgentSchema = z.object({
   instructions: z.union([z.string(), z.function().returns(z.string())]).default('You are a helpful agent.'),
   functions: z.array(FunctionSchema).default([]),
   toolChoice: z.string().nullable().default(null),
-  parallelToolCalls: z.boolean().default(true)
+  parallelToolCalls: z.union([z.boolean(), z.number()]).default(true)
 });
 
 export const ResponseSchema = z.object({
