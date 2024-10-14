@@ -1,252 +1,164 @@
-import OpenAI from 'openai';
-import { debugPrint, mergeChunk, functionToJson } from './util.js';
-import { Agent, Response, Result } from './types.js';
+import { OpenAI } from 'openai';
+import { debugPrint, mergeChunk } from './util.js';
+import { Response, Result, Agent } from './types.js';
 
-const __CTX_VARS_NAME__ = "context_variables";
+const createOpenAIClient = (client = null) => client || new OpenAI();
 
-export class Swarm {
-  constructor(client = null) {
-    this.openai = client || new OpenAI();
+const createChatCompletionParams = (agent, history, contextVariables, modelOverride, stream) => {
+  const instructions = typeof agent.instructions === 'function' 
+    ? agent.instructions(contextVariables) 
+    : agent.instructions;
+
+  const messages = [{ role: 'system', content: instructions }, ...history];
+  const tools = agent.functions.map(f => ({
+    type: 'function',
+    function: {
+      name: f.name,
+      description: f.description,
+      parameters: f.function.length > 0 ? { type: 'object', properties: { question: { type: 'string' } }, required: ['question'] } : {}
+    }
+  }));
+
+  return {
+    model: modelOverride || agent.model,
+    messages,
+    tools: tools.length ? tools : undefined,
+    stream
+  };
+};
+
+const getChatCompletion = async (openai, agent, history, contextVariables, modelOverride, stream, debug) => {
+  debugPrint(debug, `Getting chat completion for agent: ${agent.name}`);
+  const params = createChatCompletionParams(agent, history, contextVariables, modelOverride, stream);
+  debugPrint(debug, `Chat completion parameters: ${JSON.stringify(params, null, 2)}`);
+  return openai.chat.completions.create(params);
+};
+
+const handleFunctionResult = (result, debug) => {
+  debugPrint(debug, `Handling function result: ${JSON.stringify(result)}`);
+  if (result instanceof Result) {
+    return result;
   }
+  if (result instanceof Agent) {
+    return new Result({ value: JSON.stringify({ assistant: result.name }), agent: result });
+  }
+  return new Result({ value: String(result) });
+};
 
-  async getChatCompletion(agent, history, contextVariables, modelOverride, stream, debug) {
-    const instructions = typeof agent.instructions === 'function' 
-      ? agent.instructions(contextVariables) 
-      : agent.instructions;
+const handleToolCalls = async (toolCalls, agent, contextVariables, debug) => {
+  debugPrint(debug, `Handling ${toolCalls.length} tool calls for agent: ${agent.name}`);
+  const partialResponse = new Response();
 
-    const messages = [{ role: 'system', content: instructions }, ...history];
-    debugPrint(debug, "Getting chat completion for...:", messages);
+  for (const toolCall of toolCalls) {
+    const name = toolCall.function.name;
+    debugPrint(debug, `Processing tool call: ${name}`);
+    const func = agent.functions.find(f => f.name === name)?.function;
 
-    const tools = agent.functions.map(f => ({
-      type: 'function',
-      function: {
-        name: f.name,
-        description: f.description,
-        parameters: {
-          type: 'object',
-          properties: f.function.length > 0 ? { question: { type: 'string' } } : {},
-          required: f.function.length > 0 ? ['question'] : []
-        }
-      }
-    }));
-
-    // Hide context_variables from model
-    for (const tool of tools) {
-      const params = tool.function.parameters;
-      delete params.properties[__CTX_VARS_NAME__];
-      if (params.required) {
-        params.required = params.required.filter(param => param !== __CTX_VARS_NAME__);
-      }
+    if (!func) {
+      partialResponse.messages.push({ role: 'tool', tool_call_id: toolCall.id, content: `Error: Tool ${name} not found.` });
+      continue;
     }
 
-    const createParams = {
-      model: modelOverride || agent.model,
-      messages,
-      tools: tools.length > 0 ? tools : undefined,
-      stream
-    };
-
-    if (tools.length > 0) {
-      createParams.tool_choice = agent.toolChoice === 'auto' ? 'auto' : { type: 'function', function: { name: agent.toolChoice } };
+    let args;
+    try {
+      args = JSON.parse(toolCall.function.arguments);
+    } catch {
+      partialResponse.messages.push({ role: 'tool', tool_call_id: toolCall.id, content: `Error: Invalid arguments for ${name}.` });
+      continue;
     }
 
-    return this.openai.chat.completions.create(createParams);
-  }
-
-  handleFunctionResult(result, debug) {
-    if (result instanceof Result) {
-      return result;
-    } else if (result instanceof Agent) {
-      return new Result({
-        value: JSON.stringify({ assistant: result.name }),
-        agent: result
-      });
-    } else {
-      try {
-        return new Result({ value: String(result) });
-      } catch (e) {
-        const errorMessage = `Failed to cast response to string: ${result}. Make sure agent functions return a string or Result object. Error: ${e.message}`;
-        debugPrint(debug, errorMessage);
-        throw new TypeError(errorMessage);
-      }
-    }
-  }
-
-  async handleToolCalls(toolCalls, agent, contextVariables, debug) {
-    const partialResponse = new Response();
-
-    for (const toolCall of toolCalls) {
-      const name = toolCall.function.name;
-      const func = agent.getFunction(name);
-      
-      if (!func) {
-        debugPrint(debug, `Tool ${name} not found in function map.`);
-        partialResponse.messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          tool_name: name,
-          content: `Error: Tool ${name} not found.`
-        });
-        continue;
-      }
-
-      let args;
-      try {
-        args = JSON.parse(toolCall.function.arguments);
-      } catch (error) {
-        debugPrint(debug, `Error parsing arguments for ${name}: ${error.message}`);
-        partialResponse.messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          tool_name: name,
-          content: `Error: Invalid arguments provided for ${name}.`
-        });
-        continue;
-      }
-
-      debugPrint(debug, `Processing tool call: ${name} with arguments ${JSON.stringify(args)}`);
-
-      if (func.length > 0 && func.toString().includes(__CTX_VARS_NAME__)) {
-        args[__CTX_VARS_NAME__] = contextVariables;
-      }
-
+    try {
+      debugPrint(debug, `Executing function ${name} with args: ${JSON.stringify(args)}`);
       const rawResult = await func(args);
-      const result = this.handleFunctionResult(rawResult, debug);
-
-      partialResponse.messages.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        tool_name: name,
-        content: result.value
-      });
-
-      partialResponse.contextVariables = { ...partialResponse.contextVariables, ...result.contextVariables };
+      const result = handleFunctionResult(rawResult, debug);
+      partialResponse.messages.push({ role: 'tool', tool_call_id: toolCall.id, content: result.value });
+      Object.assign(partialResponse.contextVariables, result.contextVariables);
       if (result.agent) {
         partialResponse.agent = result.agent;
       }
+    } catch (error) {
+      partialResponse.messages.push({ role: 'tool', tool_call_id: toolCall.id, content: `Error executing ${name}: ${error.message}` });
     }
-
-    return partialResponse;
   }
 
-  async run({ agent, messages, contextVariables = {}, modelOverride = null, stream = false, debug = false, maxTurns = Infinity, executeTools = true }) {
-    if (stream) {
-      return this.runAndStream({ agent, messages, contextVariables, modelOverride, debug, maxTurns, executeTools });
-    }
+  return partialResponse;
+};
 
-    let activeAgent = agent;
-    let history = [...messages];
-    const initLen = messages.length;
+const run = async ({ openai, agent, messages, contextVariables = {}, modelOverride = null, stream = false, debug = false, maxTurns = Infinity, executeTools = true }) => {
+  debugPrint(debug, `Starting run with agent: ${agent.name}`);
 
-    while (history.length - initLen < maxTurns && activeAgent) {
-      const completion = await this.getChatCompletion(
-        activeAgent,
-        history,
-        contextVariables,
-        modelOverride,
-        stream,
-        debug
-      );
-
-      const message = completion.choices[0].message;
-      debugPrint(debug, "Received completion:", message);
-      message.sender = activeAgent.name;
-      history.push(JSON.parse(JSON.stringify(message)));
-
-      if (!message.tool_calls || !executeTools) {
-        debugPrint(debug, "Ending turn.");
-        break;
-      }
-
-      const partialResponse = await this.handleToolCalls(
-        message.tool_calls,
-        activeAgent,
-        contextVariables,
-        debug
-      );
-
-      history.push(...partialResponse.messages);
-      contextVariables = { ...contextVariables, ...partialResponse.contextVariables };
-      if (partialResponse.agent) {
-        activeAgent = partialResponse.agent;
-      }
-    }
-
-    return new Response({
-      messages: history.slice(initLen),
-      agent: activeAgent,
-      contextVariables
-    });
+  if (stream) {
+    return runAndStream({ openai, agent, messages, contextVariables, modelOverride, debug, maxTurns, executeTools });
   }
 
-  async *runAndStream({ agent, messages, contextVariables = {}, modelOverride = null, debug = false, maxTurns = Infinity, executeTools = true }) {
-    let activeAgent = agent;
-    let history = [...messages];
-    const initLen = messages.length;
+  let activeAgent = agent;
+  let history = [...messages];
 
-    while (history.length - initLen < maxTurns) {
-      let message = {
-        content: "",
-        sender: agent.name,
-        role: "assistant",
-        function_call: null,
-        tool_calls: {}
-      };
+  while (history.length - messages.length < maxTurns && activeAgent) {
+    const completion = await getChatCompletion(openai, activeAgent, history, contextVariables, modelOverride, false, debug);
+    const message = { ...completion.choices[0].message, sender: activeAgent.name };
+    history.push(message);
 
-      const completion = await this.getChatCompletion(
-        activeAgent,
-        history,
-        contextVariables,
-        modelOverride,
-        true,
-        debug
-      );
-
-      yield { delim: "start" };
-      for await (const chunk of completion) {
-        const delta = chunk.choices[0].delta;
-        if (delta.role === "assistant") {
-          delta.sender = activeAgent.name;
-        }
-        yield delta;
-        mergeChunk(message, delta);
-      }
-      yield { delim: "end" };
-
-      message.tool_calls = Object.values(message.tool_calls);
-      if (message.tool_calls.length === 0) {
-        message.tool_calls = null;
-      }
-      debugPrint(debug, "Received completion:", message);
-      history.push(message);
-
-      if (!message.tool_calls || !executeTools) {
-        debugPrint(debug, "Ending turn.");
-        break;
-      }
-
-      const partialResponse = await this.handleToolCalls(
-        message.tool_calls,
-        activeAgent,
-        contextVariables,
-        debug
-      );
-
-      history.push(...partialResponse.messages);
-      contextVariables = { ...contextVariables, ...partialResponse.contextVariables };
-      if (partialResponse.agent) {
-        activeAgent = partialResponse.agent;
-      }
+    if (!message.tool_calls || !executeTools) {
+      break;
     }
 
-    yield {
-      response: new Response({
-        messages: history.slice(initLen),
-        agent: activeAgent,
-        contextVariables
-      })
-    };
+    const partialResponse = await handleToolCalls(message.tool_calls, activeAgent, contextVariables, debug);
+    history.push(...partialResponse.messages);
+    Object.assign(contextVariables, partialResponse.contextVariables);
+    if (partialResponse.agent) {
+      activeAgent = partialResponse.agent;
+    }
   }
-}
+
+  return new Response({ messages: history.slice(messages.length), agent: activeAgent, contextVariables });
+};
+
+const runAndStream = async function* ({ openai, agent, messages, contextVariables = {}, modelOverride = null, debug = false, maxTurns = Infinity, executeTools = true }) {
+  debugPrint(debug, `Starting streaming run with agent: ${agent.name}`);
+
+  let activeAgent = agent;
+  let history = [...messages];
+
+  while (history.length - messages.length < maxTurns) {
+    let message = { content: "", sender: agent.name, role: "assistant", function_call: null };
+
+    const completion = await getChatCompletion(openai, activeAgent, history, contextVariables, modelOverride, true, debug);
+
+    yield { delim: "start" };
+    for await (const chunk of completion) {
+      const delta = chunk.choices[0].delta;
+      if (delta.role === "assistant") {
+        delta.sender = activeAgent.name;
+      }
+      yield delta;
+      mergeChunk(message, delta);
+    }
+    yield { delim: "end" };
+
+    history.push(message);
+
+    if (!message.function_call || !executeTools) {
+      break;
+    }
+
+    const partialResponse = await handleToolCalls([message.function_call], activeAgent, contextVariables, debug);
+    history.push(...partialResponse.messages);
+    Object.assign(contextVariables, partialResponse.contextVariables);
+    if (partialResponse.agent) {
+      activeAgent = partialResponse.agent;
+    }
+  }
+
+  yield { response: new Response({ messages: history.slice(messages.length), agent: activeAgent, contextVariables }) };
+};
+
+export const createSwarm = (client = null) => {
+  const openai = createOpenAIClient(client);
+  return {
+    run: (params) => run({ ...params, openai }),
+    runAndStream: (params) => runAndStream({ ...params, openai })
+  };
+};
 
 export { Result, Response };

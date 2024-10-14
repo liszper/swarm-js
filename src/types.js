@@ -1,7 +1,14 @@
 import { z } from 'zod';
 
-// Define AgentFunction type
-const AgentFunction = z.function().returns(z.union([z.string(), z.lazy(() => AgentSchema), z.record(z.any())]));
+// Define AgentFunction type to allow for async functions
+const AgentFunction = z.function().returns(
+  z.union([
+    z.string(),
+    z.lazy(() => AgentSchema),
+    z.record(z.any()),
+    z.promise(z.union([z.string(), z.lazy(() => AgentSchema), z.record(z.any())]))
+  ])
+);
 
 // Update FunctionSchema to match AgentFunction
 const FunctionSchema = z.object({
