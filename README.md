@@ -12,7 +12,7 @@ An educational framework exploring ergonomic, lightweight multi-agent orchestrat
 Requires Node.js 14+
 
 ```shell
-npm install swarm-nodejs
+bun i && bun run
 ```
 
 ## Usage
